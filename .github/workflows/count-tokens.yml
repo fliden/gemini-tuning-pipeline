@@ -1,0 +1,116 @@
+name: 💰 Estimate Training Cost (Tokens)
+
+on:
+  # Manual Trigger
+  workflow_dispatch:
+    inputs:
+      dataset_path:
+        description: 'Path to training data file in repo (Leave blank for default)'
+        required: false
+        default: 'data/training.jsonl'
+      model_name:
+        description: 'Model to count tokens against (e.g., gemini-2.5-flash-001)'
+        required: false
+        default: 'gemini-2.0-flash-001'
+
+permissions:
+  contents: 'read'
+  id-token: 'write' # Required for Workload Identity Federation
+
+jobs:
+  token-count:
+    runs-on: ubuntu-latest
+    
+    env:
+      PYTHON_VERSION: '3.10'
+      VENV_NAME: '.venv'
+      GCP_LOCATION: 'us-central1'
+
+    steps:
+      - name: ⬇️ Checkout Repository
+        uses: actions/checkout@v4
+
+      # 1. Authenticate (WIF)
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v2'
+        id: auth # Keep ID for context
+        with:
+          workload_identity_provider: '${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}'
+          service_account: '${{ secrets.GCP_SERVICE_ACCOUNT }}'
+        continue-on-error: false 
+
+      # 2. Setup gcloud CLI
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+
+      # 3. Setup Python & Install Dependencies
+      - name: 'Set up Python & Install Dependencies'
+        uses: 'actions/setup-python@v5'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: 'Install SDKs in VENV'
+        run: |
+          python -m venv ${{ env.VENV_NAME }}
+          source ${{ env.VENV_NAME }}/bin/activate
+          # Install using requirements.txt (assumed to be created)
+          pip install google-genai 
+
+      # 4. Execute Token Counting and Capture Output
+      - name: '📊 Execute Token Counting'
+        id: token_count_step # ID for output capture
+        run: |
+          source ${{ env.VENV_NAME }}/bin/activate
+          
+          # Extract Project ID from Service Account email
+          # Format: name@PROJECT_ID.iam.gserviceaccount.com
+          export GCP_PROJECT=$(echo "${{ secrets.GCP_SERVICE_ACCOUNT }}" | cut -d'@' -f2 | cut -d'.' -f1)
+          
+          if [ -z "$GCP_PROJECT" ]; then
+            echo "::error::Failed to extract project ID from service account email"
+            exit 1
+          fi
+          
+          echo "Using Project ID: $GCP_PROJECT"
+          
+          # Run script and capture ALL output into a variable
+          PYTHON_OUTPUT=$(python scripts/count_tokens.py \
+            "${{ inputs.dataset_path }}" \
+            --model="${{ inputs.model_name }}" 2>&1)
+            
+          # Print the full output to the log for debugging
+          echo "$PYTHON_OUTPUT"
+          
+          # --- Capture and parse the final token count ---
+          # 1. Look for the 'Total Training Tokens' line
+          # 2. Extract the last field (the number)
+          # 3. Remove commas (tr -d ',') for clean number handling
+          TOKEN_COUNT=$(echo "$PYTHON_OUTPUT" | grep "Total Training Tokens:" | awk '{print $NF}' | tr -d ',')
+          
+          # Check if the token count is a valid number (i.e., script succeeded)
+          if ! [[ "$TOKEN_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "::error::Token count failed or returned invalid output. Check the full log above."
+            exit 1
+          fi
+          
+          # Export the raw number and the 3-epoch estimation for the summary step
+          echo "RAW_TOKENS=$TOKEN_COUNT" >> $GITHUB_OUTPUT
+          echo "ESTIMATED_COST_TOKENS=$((TOKEN_COUNT * 3))" >> $GITHUB_OUTPUT
+        continue-on-error: false 
+
+      # 5. Final Summary Step (Displays prominently on the run summary page)
+      - name: '✅ Display Final Token Summary'
+        if: success() # Only run if token counting succeeded
+        run: |
+          TOKENS_RAW="${{ steps.token_count_step.outputs.RAW_TOKENS }}"
+          TOKENS_EST="${{ steps.token_count_step.outputs.ESTIMATED_COST_TOKENS }}"
+          
+          echo "### 💰 Training Cost Estimate (Token Count)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Total Dataset Tokens** | **${TOKENS_RAW}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Estimated Tokens (3 Epochs) | ${TOKENS_EST} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Run the fine-tuning workflow when ready." >> $GITHUB_STEP_SUMMARY
